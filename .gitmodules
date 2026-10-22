@@ -1,0 +1,3 @@
+[submodule "native/portmux"]
+	path = native/portmux
+	url = https://github.com/XNet-NGO/portmux

@@ -29,15 +29,35 @@ Built with the official [Kotlin MCP SDK](https://github.com/modelcontextprotocol
 
 The MCP layer talks to a `PortmuxEngine` interface. Two backends share it:
 
-- **CLI backend** (default, `CliPortmuxEngine`) — spawns the portmux CLI binary.
-  Cross-platform; the right fit on desktop and on Android via Termux/Shizuku.
-  Uses the published [portmux release artifacts](https://github.com/XNet-NGO/portmux/releases).
-- **Native/JNI backend** (for in-process use on Android) — can implement the
-  same interface against `libportmux.a`, reusing the JNI shim from the
-  Switchboard app, without any change to the MCP tool layer.
+- **Native (embedded) backend** (`NativePortmuxEngine`, **default**) — portmux is
+  compiled from source into a JNI library (`libportmuxjni`) that is bundled in
+  the JAR and loaded at runtime. portmux runs **in-process**; nothing is
+  installed separately. This is the recommended, self-contained setup.
+- **CLI backend** (`CliPortmuxEngine`, fallback) — spawns an external portmux
+  binary (`PORTMUX_BIN`). Used automatically only if the native library is not
+  bundled for the current platform.
 
-portmux fixes its routes at `run()`, so the CLI backend keeps the route set in
-memory and (re)spawns the CLI whenever routes change while running.
+At startup the server picks the native backend when `libportmuxjni` is present
+for the platform, otherwise falls back to the CLI backend.
+
+portmux fixes its routes at `run()`, so both backends keep the route set in
+memory and re-run the engine whenever routes change while running.
+
+### Building the embedded native library
+
+The native lib is generated from the vendored `native/portmux` submodule (it in
+turn vendors hev-task-system), compiled with `-fPIC` and linked with the JNI
+shim into `libportmuxjni.<ext>` under
+`src/main/resources/native/<os>-<arch>/`, where it gets bundled into the JAR.
+
+```sh
+git submodule update --init --recursive
+JAVA_HOME=/path/to/jdk ./native/build-jni.sh   # linux/macos, x86_64/aarch64
+./gradlew installDist
+```
+
+Supported hosts: linux and macOS, x86_64 and aarch64. On a platform without a
+built lib, the server runs with the CLI backend instead.
 
 ## Safety
 
@@ -63,7 +83,7 @@ Environment:
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `PORTMUX_BIN` | `portmux` (PATH) | portmux executable for the CLI backend |
+| `PORTMUX_BIN` | `portmux` (PATH) | portmux executable for the CLI *fallback* backend |
 | `PORTMUX_ALLOW_ANY_TARGET` | unset | `1` allows non-loopback targets |
 
 ## Connect an MCP client
@@ -81,10 +101,12 @@ curl -s -X POST http://127.0.0.1:3339/mcp \
 
 ## Verified
 
-Built and run locally; the full MCP flow was exercised over Streamable HTTP:
-`initialize` → `tools/list` (6 tools) → `add_route` → `list_routes` → `status`,
-plus the loopback safety gate (non-loopback target rejected) and graceful
-error when the portmux binary is absent.
+Built and run locally with the **embedded native engine**. The full MCP flow
+was exercised over Streamable HTTP: `initialize` → `tools/list` (6 tools) →
+`add_route` → `start`, and an actual TCP connection through the in-process
+engine was forwarded to a loopback echo target and returned — then `stop`
+closed the in-process listener. The loopback safety gate (non-loopback target
+rejected) was confirmed.
 
 ## Versions
 

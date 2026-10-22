@@ -67,13 +67,17 @@ class CliPortmuxEngine(
 
     override fun isRunning(): Boolean = lock.withLock { process?.isAlive == true }
 
-    override fun start() = lock.withLock {
-        if (process?.isAlive == true) return
-        if (routes.isEmpty()) throw IllegalStateException("no routes to start")
-        respawn()
+    override fun start() {
+        lock.withLock {
+            if (process?.isAlive == true) return
+            if (routes.isEmpty()) throw IllegalStateException("no routes to start")
+            respawn()
+        }
     }
 
-    override fun stop() = lock.withLock { stopLocked() }
+    override fun stop() {
+        lock.withLock { stopLocked() }
+    }
 
     // --- internals (call with lock held) ---
 
