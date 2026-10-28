@@ -6,3 +6,4 @@
 /.kotlin/
 # Generated native JNI lib (produced by native/build-jni.sh)
 /src/main/resources/native/
+*.pre-optA.bak
