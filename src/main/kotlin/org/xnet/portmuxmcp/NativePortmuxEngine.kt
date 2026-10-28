@@ -13,6 +13,10 @@ import kotlin.concurrent.thread
  * while running tears down the native instance and re-runs on a fresh worker
  * thread with the updated route set.
  *
+ * Egress (desktop subset): NONE (default/loopback), SOURCE (bind local IP,
+ * `src=`), and DEVICE (SO_BINDTODEVICE to an interface, `dev=`; needs
+ * CAP_NET_RAW / root). The Android-only NETWORK/CALLBACK pin is not offered.
+ *
  * @param allowNonLoopbackTargets off by default (loopback-only), same safety
  *   gate as the CLI backend.
  */
@@ -26,9 +30,16 @@ class NativePortmuxEngine(
     private var handle: Long = 0L
     private var worker: Thread? = null
 
+    // Tunnel secrets kept out of the Route (which is returned to callers/logged):
+    // the PSK (64 hex) and cipher per tunnel/peer route id.
+    private val tunnelPsk = HashMap<String, String>()
+    private val tunnelCipher = HashMap<String, Int>()
+
     init {
         NativeLoader.load()
     }
+
+    private fun Char.isHexDigit() = this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
 
     override fun addRoute(
         proto: Proto,
@@ -36,28 +47,198 @@ class NativePortmuxEngine(
         listenPort: Int,
         targetAddr: String,
         targetPort: Int,
+        egress: EgressMode,
+        egressArg: String,
     ): Route = lock.withLock {
         require(listenPort in 1..65535) { "listen port $listenPort out of range" }
         require(targetPort in 1..65535) { "target port $targetPort out of range" }
-        if (!allowNonLoopbackTargets && !isLoopback(targetAddr)) {
+        val target = targetAddr.ifBlank { "127.0.0.1" }
+        if (!allowNonLoopbackTargets && !isLoopback(target)) {
             throw IllegalArgumentException(
-                "target '$targetAddr' is not loopback; set PORTMUX_ALLOW_ANY_TARGET=1 to allow non-loopback targets",
+                "target '$target' is not loopback; set PORTMUX_ALLOW_ANY_TARGET=1 to allow non-loopback targets",
             )
         }
+        validateEgress(egress, egressArg)
         val route = Route(
             id = UUID.randomUUID().toString().take(8),
             proto = proto,
             listenAddr = listenAddr.ifBlank { "127.0.0.1" },
             listenPort = listenPort,
-            targetAddr = targetAddr.ifBlank { "127.0.0.1" },
+            targetAddr = target,
             targetPort = targetPort,
+            egress = egress,
+            egressArg = egressArg,
         )
         routes[route.id] = route
         if (worker != null) respawn()
         route
     }
 
+    override fun addSocks(
+        listenAddr: String,
+        listenPort: Int,
+        egress: EgressMode,
+        egressArg: String,
+    ): Route = lock.withLock {
+        require(listenPort in 1..65535) { "listen port $listenPort out of range" }
+        if (!allowNonLoopbackTargets) {
+            throw IllegalStateException(
+                "add_socks creates an OPEN PROXY to arbitrary destinations; " +
+                    "set PORTMUX_ALLOW_ANY_TARGET=1 to allow it",
+            )
+        }
+        validateEgress(egress, egressArg)
+        val route = Route(
+            id = UUID.randomUUID().toString().take(8),
+            proto = Proto.TCP,
+            listenAddr = listenAddr.ifBlank { "127.0.0.1" },
+            listenPort = listenPort,
+            targetAddr = "",
+            targetPort = 0,
+            isSocks = true,
+            egress = egress,
+            egressArg = egressArg,
+        )
+        routes[route.id] = route
+        if (worker != null) respawn()
+        route
+    }
+
+    override fun addTunnel(
+        serverAddr: String,
+        serverPort: Int,
+        targetAddr: String,
+        targetPort: Int,
+        pskHex: String,
+        cipher: Int,
+        egress: EgressMode,
+        egressArg: String,
+        revListenAddr: String,
+        revListenPort: Int,
+        revTargetAddr: String,
+        revTargetPort: Int,
+        revProto: Int,
+        jumpHops: List<String>,
+        jumpTargetAddr: String,
+        jumpTargetPort: Int,
+        jumpProto: Int,
+    ): Route = lock.withLock {
+        require(serverPort in 1..65535) { "server port $serverPort out of range" }
+        require(targetPort in 1..65535) { "target port $targetPort out of range" }
+        require(pskHex.length == 64 && pskHex.all { it.isHexDigit() }) {
+            "psk must be 64 hex chars (32 bytes)"
+        }
+        require(serverAddr.isNotBlank()) { "server address required" }
+        // Reaching an arbitrary off-device server is sensitive.
+        if (!allowNonLoopbackTargets && !isLoopback(serverAddr)) {
+            throw IllegalArgumentException(
+                "tunnel server '$serverAddr' is not loopback; set PORTMUX_ALLOW_ANY_TARGET=1 to allow it",
+            )
+        }
+        // Reverse-FORWARD route (ssh -R style): a reverse listener paired with a
+        // reverse target. A JUMP route (jumpHops set) ALSO uses revListenPort as
+        // its local OPENJ entry but has NO reverse target, so skip the
+        // reverse-target checks in that case (handled in the jump block below).
+        if (revListenPort > 0 && jumpHops.isEmpty()) {
+            require(revListenPort in 1..65535) { "reverse listen port $revListenPort out of range" }
+            require(revTargetPort in 1..65535) { "reverse target port $revTargetPort out of range" }
+            require(revProto in 0..2) { "reverse proto must be 0(TCP), 1(UDP), or 2(BOTH)" }
+            val rtarget = revTargetAddr.ifBlank { "127.0.0.1" }
+            if (!allowNonLoopbackTargets && !isLoopback(rtarget)) {
+                throw IllegalArgumentException(
+                    "reverse target '$rtarget' is not loopback; set PORTMUX_ALLOW_ANY_TARGET=1 to allow it",
+                )
+            }
+        }
+        if (jumpHops.isNotEmpty()) {
+            require(jumpHops.size in 1..PM_MUX_MAX_HOPS) {
+                "jump hops count ${jumpHops.size} out of range (1..$PM_MUX_MAX_HOPS)"
+            }
+            require(jumpProto in 0..1) { "jump proto must be 0(TCP) or 1(UDP)" }
+            require(jumpTargetPort in 1..65535) { "jump target port $jumpTargetPort out of range" }
+            require(revListenPort > 0) {
+                "jump routing requires a reverse listener (revListenPort>0) as the local OPENJ entry"
+            }
+            val first = jumpHops.first()
+            require(first == "$serverAddr:$serverPort") {
+                "jumpHops[0] ('$first') must equal the carrier dest '$serverAddr:$serverPort'"
+            }
+            val jtarget = jumpTargetAddr.ifBlank { "127.0.0.1" }
+            if (!allowNonLoopbackTargets && !isLoopback(jtarget)) {
+                throw IllegalArgumentException(
+                    "jump target '$jtarget' is not loopback; set PORTMUX_ALLOW_ANY_TARGET=1 to allow it",
+                )
+            }
+        }
+        validateEgress(egress, egressArg)
+        val route = Route(
+            id = UUID.randomUUID().toString().take(8),
+            proto = Proto.TCP,
+            listenAddr = "",
+            listenPort = 0,
+            targetAddr = targetAddr.ifBlank { "127.0.0.1" },
+            targetPort = targetPort,
+            isTunnel = true,
+            serverAddr = serverAddr,
+            serverPort = serverPort,
+            egress = egress,
+            egressArg = egressArg,
+            revListenAddr = revListenAddr,
+            revListenPort = revListenPort,
+            revTargetAddr = revTargetAddr,
+            revTargetPort = revTargetPort,
+            revProto = revProto,
+            jumpHops = jumpHops,
+            jumpTargetAddr = jumpTargetAddr.ifBlank { "127.0.0.1" },
+            jumpTargetPort = jumpTargetPort,
+            jumpProto = jumpProto,
+        )
+        tunnelPsk[route.id] = pskHex
+        tunnelCipher[route.id] = cipher
+        routes[route.id] = route
+        if (worker != null) respawn()
+        route
+    }
+
+    override fun addPeer(
+        listenAddr: String,
+        listenPort: Int,
+        pskHex: String,
+        cipher: Int,
+        egress: EgressMode,
+        egressArg: String,
+    ): Route = lock.withLock {
+        require(listenPort in 1..65535) { "listen port $listenPort out of range" }
+        require(pskHex.length == 64 && pskHex.all { it.isHexDigit() }) {
+            "psk must be 64 hex chars (32 bytes)"
+        }
+        if (!allowNonLoopbackTargets) {
+            throw IllegalStateException(
+                "add_peer relays to arbitrary next hops / terminal targets; " +
+                    "set PORTMUX_ALLOW_ANY_TARGET=1 to allow it",
+            )
+        }
+        validateEgress(egress, egressArg)
+        val route = Route(
+            id = UUID.randomUUID().toString().take(8),
+            proto = Proto.TCP,
+            listenAddr = listenAddr.ifBlank { "127.0.0.1" },
+            listenPort = listenPort,
+            targetAddr = "",
+            targetPort = 0,
+            isPeer = true,
+            egress = egress,
+            egressArg = egressArg,
+        )
+        tunnelPsk[route.id] = pskHex
+        tunnelCipher[route.id] = cipher
+        routes[route.id] = route
+        if (worker != null) respawn()
+        route
+    }
+
     override fun removeRoute(id: String): Boolean = lock.withLock {
+        tunnelPsk.remove(id); tunnelCipher.remove(id)
         val removed = routes.remove(id) != null
         if (removed && worker != null) {
             if (routes.isEmpty()) stopLocked() else respawn()
@@ -83,20 +264,62 @@ class NativePortmuxEngine(
 
     // --- internals (lock held) ---
 
+    private fun validateEgress(egress: EgressMode, egressArg: String) {
+        if (egress == EgressMode.SOURCE && egressArg.isBlank()) {
+            throw IllegalArgumentException("SOURCE egress requires a source IP (egress_arg / src=)")
+        }
+        if (egress == EgressMode.DEVICE && egressArg.isBlank()) {
+            throw IllegalArgumentException("DEVICE egress requires an interface name (egress_arg / dev=)")
+        }
+    }
+
+    private fun egressKind(egress: EgressMode): Int = when (egress) {
+        EgressMode.NONE -> EGRESS_NONE
+        EgressMode.SOURCE -> EGRESS_SOURCE
+        EgressMode.DEVICE -> EGRESS_DEVICE
+    }
+
     private fun respawn() {
         stopLocked()
         val h = nativeNew()
         if (h == 0L) throw IllegalStateException("portmux_new failed")
         handle = h
         routes.values.forEach { r ->
-            val proto = if (r.proto == Proto.TCP) 0 else 1
-            val rc = nativeAddRoute(
-                h, proto, r.listenAddr, r.listenPort,
-                r.targetAddr, r.targetPort, 0, "",
-            )
+            val kind = egressKind(r.egress)
+            val rc = if (r.isTunnel) {
+                val crc = nativeAddTunnelClient(
+                    h, r.serverAddr, r.serverPort, r.targetAddr, r.targetPort,
+                    tunnelPsk[r.id] ?: "", tunnelCipher[r.id] ?: 0,
+                    kind, r.egressArg,
+                    r.revListenAddr, r.revListenPort, r.revTargetAddr, r.revTargetPort, r.revProto,
+                )
+                // v0.5.0: configure the edge jump-list immediately after the
+                // edge client is added (set_jumps targets the most-recent route).
+                if (crc == 0 && r.jumpHops.isNotEmpty()) {
+                    val hopsAddrCsv = r.jumpHops.joinToString(",") { it.substringBeforeLast(':') }
+                    val hopsPortCsv = r.jumpHops.joinToString(",") { it.substringAfterLast(':') }
+                    nativeSetJumps(h, hopsAddrCsv, hopsPortCsv, r.jumpTargetAddr, r.jumpTargetPort, r.jumpProto)
+                } else {
+                    crc
+                }
+            } else if (r.isPeer) {
+                nativeAddTunnelPeer(
+                    h, r.listenAddr, r.listenPort,
+                    tunnelPsk[r.id] ?: "", tunnelCipher[r.id] ?: 0,
+                    kind, r.egressArg,
+                )
+            } else if (r.isSocks) {
+                nativeAddSocks(h, r.listenAddr, r.listenPort, kind, r.egressArg)
+            } else {
+                val proto = if (r.proto == Proto.TCP) 0 else 1
+                nativeAddRoute(
+                    h, proto, r.listenAddr, r.listenPort,
+                    r.targetAddr, r.targetPort, kind, r.egressArg,
+                )
+            }
             if (rc != 0) {
                 nativeDestroy(h); handle = 0L
-                throw IllegalStateException("add_route failed for ${r.summary()}")
+                throw IllegalStateException("add failed for ${r.summary()}")
             }
         }
         val t = thread(name = "portmux-run", isDaemon = true) {
@@ -128,7 +351,42 @@ class NativePortmuxEngine(
         targetAddr: String, targetPort: Int,
         egressKind: Int, egressArg: String,
     ): Int
+    private external fun nativeAddSocks(
+        handle: Long,
+        listenAddr: String, listenPort: Int,
+        egressKind: Int, egressArg: String,
+    ): Int
+    private external fun nativeAddTunnelClient(
+        handle: Long,
+        serverAddr: String, serverPort: Int,
+        targetAddr: String, targetPort: Int,
+        pskHex: String, cipher: Int,
+        egressKind: Int, egressArg: String,
+        rlistenAddr: String, rlistenPort: Int,
+        rtargetAddr: String, rtargetPort: Int, rproto: Int,
+    ): Int
+    private external fun nativeAddTunnelPeer(
+        handle: Long,
+        listenAddr: String, listenPort: Int,
+        pskHex: String, cipher: Int,
+        egressKind: Int, egressArg: String,
+    ): Int
+    private external fun nativeSetJumps(
+        handle: Long,
+        hopsAddrCsv: String, hopsPortCsv: String,
+        targetAddr: String, targetPort: Int, proto: Int,
+    ): Int
     private external fun nativeRun(handle: Long)
     private external fun nativeStop(handle: Long)
     private external fun nativeDestroy(handle: Long)
+
+    companion object {
+        // Egress kinds mirrored from portmux.h.
+        const val EGRESS_NONE = 0
+        const val EGRESS_DEVICE = 2
+        const val EGRESS_SOURCE = 1
+
+        // Cap on jump-list length, mirrored from portmux-tunnel.h (v0.5.0).
+        const val PM_MUX_MAX_HOPS = 8
+    }
 }
