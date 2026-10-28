@@ -61,6 +61,10 @@ data class Route(
      *  the terminal target. A peer listens on [listenAddr]:[listenPort] for
      *  encrypted carriers; it has no fixed forward target of its own. */
     val isPeer: Boolean = false,
+    /** True if this is an encrypted tunnel SERVER: it accepts encrypted clients
+     *  on [listenAddr]:[listenPort] (Noise responder) and bridges each accepted
+     *  client to the local plaintext service [targetAddr]:[targetPort]. */
+    val isTunnelServer: Boolean = false,
     /** Multi-hop jumps (v0.5.0): when non-empty on an EDGE tunnel client, the
      *  ordered next-hops as "addr:port" strings. hops[0] MUST equal the
      *  client's carrier dest ([serverAddr]:[serverPort]). The OPENJ carries the
@@ -79,6 +83,9 @@ data class Route(
         }
         if (isPeer) {
             return "peer  $listenAddr:$listenPort (relay/peek-demux, encrypted)$eg"
+        }
+        if (isTunnelServer) {
+            return "tunnel-server  $listenAddr:$listenPort => $targetAddr:$targetPort (encrypted)$eg"
         }
         if (isTunnel) {
             val fwd = "tunnel  -> $serverAddr:$serverPort => $targetAddr:$targetPort (encrypted)$eg"
@@ -192,6 +199,30 @@ interface PortmuxEngine {
     fun addPeer(
         listenAddr: String,
         listenPort: Int,
+        pskHex: String,
+        cipher: Int = 0,
+        egress: EgressMode = EgressMode.NONE,
+        egressArg: String = "",
+    ): Route
+
+    /**
+     * Add an encrypted tunnel SERVER: accept encrypted clients on
+     * [listenAddr]:[listenPort] (the Noise responder side, authenticated by
+     * [pskHex], 64 hex chars) and bridge each accepted client to the local
+     * plaintext service [bridgeAddr]:[bridgePort]. [cipher] 0=AES-GCM,
+     * 1=ChaCha20-Poly1305. This is the counterpart role for a simple two-host
+     * forward loop (a client dials this server; this server bridges to its
+     * local target). Returns the created [Route]. Throws on validation error.
+     *
+     * NOTE: the native server role bridges to a LOCAL target and takes no
+     * egress; [egress]/[egressArg] are accepted for API symmetry with the other
+     * tunnel roles and validated, but only NONE is meaningful for the server.
+     */
+    fun addTunnelServer(
+        listenAddr: String,
+        listenPort: Int,
+        bridgeAddr: String,
+        bridgePort: Int,
         pskHex: String,
         cipher: Int = 0,
         egress: EgressMode = EgressMode.NONE,

@@ -13,6 +13,7 @@
  *                         egressKind, egressArg,
  *                         rla, rlp, rta, rtp, rproto)                -> int
  *   nativeAddTunnelPeer(h, la, lp, psk, cipher, egressKind, egressArg) -> int
+ *   nativeAddTunnelServer(h, la, lp, ba, bp, psk, cipher)             -> int
  *   nativeSetJumps(h, hopsAddrCsv, hopsPortCsv, ta, tp, proto)       -> int
  *   nativeRun(h)                                     (BLOCKS - worker thread)
  *   nativeStop(h)
@@ -251,6 +252,43 @@ Java_org_xnet_portmuxmcp_NativePortmuxEngine_nativeAddTunnelPeer (
 
     int rc = portmux_add_tunnel_peer (pm, la[0] ? la : "127.0.0.1",
                                       (int)listenPort, psk, cph, egp);
+
+    memset (psk, 0, sizeof psk);
+    return rc;
+}
+
+/* Encrypted tunnel SERVER: accept encrypted clients on listenAddr:listenPort
+   (the Noise responder side) and bridge each accepted client to the local
+   plaintext service bridgeAddr:bridgePort. pskHex is 64 hex chars (32 bytes),
+   must match the client. cipher: 0=AES-GCM, 1=ChaCha20-Poly1305. The server
+   role has no egress parameter in the core (it bridges to a local target). */
+JNIEXPORT jint JNICALL
+Java_org_xnet_portmuxmcp_NativePortmuxEngine_nativeAddTunnelServer (
+    JNIEnv *env, jobject o, jlong h,
+    jstring listenAddr, jint listenPort,
+    jstring bridgeAddr, jint bridgePort,
+    jstring pskHex, jint cipher)
+{
+    (void)o;
+    Portmux *pm = (Portmux *)(intptr_t)h;
+    if (!pm) return -1;
+
+    char la[128], ba[128], pk[128];
+    jstr (env, listenAddr, la, sizeof la);
+    jstr (env, bridgeAddr, ba, sizeof ba);
+    jstr (env, pskHex, pk, sizeof pk);
+
+    unsigned char psk[PM_TUNNEL_PSK_LEN];
+    if (parse_psk_hex (pk, psk) < 0)
+        return -1;
+
+    PmTunnelCipher cph = (cipher == 1) ? PM_TUNNEL_CIPHER_CHACHAPOLY
+                                       : PM_TUNNEL_CIPHER_AESGCM;
+
+    int rc = portmux_add_tunnel_server (pm, la[0] ? la : "0.0.0.0",
+                                        (int)listenPort,
+                                        ba[0] ? ba : "127.0.0.1",
+                                        (int)bridgePort, psk, cph);
 
     memset (psk, 0, sizeof psk);
     return rc;

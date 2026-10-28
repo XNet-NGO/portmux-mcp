@@ -26,7 +26,7 @@ import kotlinx.serialization.json.putJsonObject
  */
 fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
     val server = Server(
-        Implementation(name = "portmux-mcp", version = "0.2.0"),
+        Implementation(name = "portmux-mcp", version = "0.2.1"),
         ServerOptions(
             capabilities = ServerCapabilities(
                 tools = ServerCapabilities.Tools(listChanged = true),
@@ -244,7 +244,8 @@ fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
                 }
                 putJsonObject("jump_hops") {
                     put("type", "string")
-                    put("description", "alternative to jumps: comma-separated \"addr:port\" next-hops (v0.5.0)")
+                    put("description", "alternative to jumps: comma-separated \"addr:port\" next-hops, " +
+                        "or a JSON array of \"addr:port\" strings (v0.5.0)")
                 }
                 putJsonObject("jump_target_addr") {
                     put("type", "string")
@@ -276,18 +277,20 @@ fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
                 "both", "tcp+udp", "dual" -> 2
                 else -> 0
             }
-            // Jumps: accept either a JSON array `jumps` or a comma-separated
-            // `jump_hops` string. Each entry is "addr:port".
-            val jumpHops: List<String> = run {
-                val arr = a["jumps"] as? kotlinx.serialization.json.JsonArray
-                if (arr != null) {
-                    arr.map { it.jsonPrimitive.content.trim() }.filter { it.isNotEmpty() }
-                } else {
-                    a["jump_hops"]?.jsonPrimitive?.content
-                        ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
-                        ?: emptyList()
-                }
+            // Jumps: accept the hop list as EITHER a JSON array (under `jumps`
+            // or `jump_hops`) OR a comma-separated string (under `jump_hops`).
+            // Each entry is "addr:port". An array element is read via jsonArray
+            // (iterate + .content); a string is split on ",". Empty array and
+            // absent both yield an empty list.
+            fun hopsFrom(el: kotlinx.serialization.json.JsonElement?): List<String>? = when (el) {
+                null -> null
+                is kotlinx.serialization.json.JsonArray ->
+                    el.map { it.jsonPrimitive.content.trim() }.filter { it.isNotEmpty() }
+                else ->
+                    el.jsonPrimitive.content.split(",").map { it.trim() }.filter { it.isNotEmpty() }
             }
+            val jumpHops: List<String> =
+                hopsFrom(a["jumps"]) ?: hopsFrom(a["jump_hops"]) ?: emptyList()
             val jumpTargetPort = a["jump_target_port"]?.jsonPrimitive?.content?.toInt() ?: 0
             val jumpProto = when (a["jump_proto"]?.jsonPrimitive?.content?.lowercase()?.trim()) {
                 "udp" -> 1
@@ -369,6 +372,70 @@ fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
                 egressArg = egressArg,
             )
             ok("added peer ${route.id}: ${route.summary()}")
+        } catch (t: Throwable) {
+            err(t.message ?: t.toString())
+        }
+    }
+
+    // --- add_tunnel_server ---
+    server.addTool(
+        name = "add_tunnel_server",
+        description = "Add an ENCRYPTED TUNNEL SERVER (Noise NoisePSK_NN responder; " +
+            "AES-256-GCM or ChaCha20-Poly1305). Accepts encrypted clients on " +
+            "listen_addr:listen_port and bridges each accepted client to a LOCAL " +
+            "plaintext service bridge_addr:bridge_port. This is the counterpart to " +
+            "add_tunnel (the client): in a simple two-host forward loop the client " +
+            "dials this server and this server bridges to its local target. The PSK " +
+            "(64 hex chars) and cipher MUST match the client. WARNING: bridging to a " +
+            "non-loopback target REQUIRES the server to have been started with " +
+            "PORTMUX_ALLOW_ANY_TARGET=1. The server role bridges to a LOCAL target " +
+            "and takes no egress of its own.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("listen_addr") {
+                    put("type", "string")
+                    put("description", "address to accept encrypted clients on (default 0.0.0.0)")
+                }
+                putJsonObject("listen_port") {
+                    put("type", "integer"); put("description", "port to accept encrypted clients on")
+                }
+                putJsonObject("bridge_addr") {
+                    put("type", "string")
+                    put("description", "local plaintext service address to bridge to (e.g. 127.0.0.1)")
+                }
+                putJsonObject("bridge_port") {
+                    put("type", "integer"); put("description", "local plaintext service port to bridge to")
+                }
+                putJsonObject("psk") {
+                    put("type", "string")
+                    put("description", "pre-shared key, 64 hex chars (32 bytes); must match the client")
+                }
+                putJsonObject("cipher") {
+                    put("type", "string"); put("description", "aesgcm (default) | chacha")
+                }
+                putEgressProps(this)
+            },
+            required = listOf("listen_port", "bridge_addr", "bridge_port", "psk"),
+        ),
+    ) { request ->
+        try {
+            val a = request.arguments ?: error("missing arguments")
+            val (egress, egressArg) = parseEgress(a)
+            val cipher = when (a["cipher"]?.jsonPrimitive?.content?.lowercase()) {
+                "chacha", "chachapoly" -> 1
+                else -> 0
+            }
+            val route = engine.addTunnelServer(
+                listenAddr = a["listen_addr"]?.jsonPrimitive?.content ?: "0.0.0.0",
+                listenPort = a["listen_port"]!!.jsonPrimitive.content.toInt(),
+                bridgeAddr = a["bridge_addr"]!!.jsonPrimitive.content,
+                bridgePort = a["bridge_port"]!!.jsonPrimitive.content.toInt(),
+                pskHex = a["psk"]!!.jsonPrimitive.content.trim(),
+                cipher = cipher,
+                egress = egress,
+                egressArg = egressArg,
+            )
+            ok("added tunnel-server ${route.id}: ${route.summary()}")
         } catch (t: Throwable) {
             err(t.message ?: t.toString())
         }

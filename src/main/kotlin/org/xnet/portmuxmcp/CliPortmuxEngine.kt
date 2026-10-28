@@ -132,6 +132,19 @@ class CliPortmuxEngine(
         "add_peer is not supported by the CLI fallback backend; use the embedded native backend",
     )
 
+    override fun addTunnelServer(
+        listenAddr: String,
+        listenPort: Int,
+        bridgeAddr: String,
+        bridgePort: Int,
+        pskHex: String,
+        cipher: Int,
+        egress: EgressMode,
+        egressArg: String,
+    ): Route = throw UnsupportedOperationException(
+        "add_tunnel_server is not supported by the CLI fallback backend; use the embedded native backend",
+    )
+
     override fun removeRoute(id: String): Boolean = lock.withLock {
         val removed = routes.remove(id) != null
         if (removed && process != null) {
