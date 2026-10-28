@@ -22,6 +22,7 @@ Built with the official [Kotlin MCP SDK](https://github.com/modelcontextprotocol
 | `add_socks` | `listen_addr?`, `listen_port`, `egress?`, `egress_arg?` | Add a SOCKS5 proxy listener (no-auth, CONNECT + UDP ASSOCIATE). An **open proxy** to arbitrary per-connection destinations; requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
 | `add_tunnel` | `server_addr`, `server_port`, `psk`, `target_addr?`, `target_port?`, `cipher?`, `egress?`, `egress_arg?`, `rlisten_addr?`, `rlisten_port?`, `rtarget_addr?`, `rtarget_port?`, `rproto?`, `jumps?`/`jump_hops?`, `jump_target_addr?`, `jump_target_port?`, `jump_proto?` | Add an encrypted NoisePSK_NN tunnel **client**. Dials a rendezvous server and splices the decrypted stream to a local target. Supports reverse-forward (ssh -R style) and multi-hop jump routing. Reaching an off-device server requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
 | `add_peer` | `listen_addr?`, `listen_port`, `psk`, `cipher?`, `egress?`, `egress_arg?` | Add a relay **peer** (single-port peek-demux tunnel server) for multi-hop jump chains. Relays OPENJ to the next hop or connects the terminal target. Requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
+| `add_tunnel_server` | `listen_addr?` (default `0.0.0.0`), `listen_port`, `bridge_addr`, `bridge_port`, `psk`, `cipher?`, `egress?`, `egress_arg?` | Add an encrypted NoisePSK_NN tunnel **server** (the responder role). Accepts encrypted clients on `listen_addr:listen_port` and bridges each to a local plaintext service `bridge_addr:bridge_port`. Counterpart to `add_tunnel` for a simple two-host forward loop. Bridging to a non-loopback target requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
 | `remove_route` | `id` | Remove a route by id. |
 | `list_routes` | — | List configured routes. |
 | `status` | — | Running state, route count, and `allow_any_target`. |
@@ -34,11 +35,28 @@ params), so the two MCP servers are consistent. The one deliberate difference is
 egress: switch-mcp pins to an Android network (`wifi`/`cellular`/`ethernet`),
 whereas this desktop server pins with `source`/`device` (see below).
 
+### Tunnel roles (client / server / peer)
+
+The portmux core exposes **three** encrypted-tunnel roles, all sharing one
+NoisePSK_NN PSK/cipher, and all three are wired here:
+
+- **`add_tunnel`** — the **client**: dials a rendezvous server and splices the
+  decrypted stream to a local target. Also supports reverse-forward (ssh -R
+  style) and multi-hop jump routing.
+- **`add_tunnel_server`** — the **server**: accepts encrypted clients and
+  bridges each to a local plaintext service. With a client this forms a simple
+  two-host forward loop (the client dials the server; the server bridges to its
+  local target).
+- **`add_peer`** — a relay **peer**: a single-port peek-demux tunnel server that
+  relays OPENJ multi-hop streams to the next hop (or connects the terminal
+  target), forming the intermediate/terminal nodes of a jump chain.
+
 ### Egress (desktop interface pinning)
 
 `add_route`, `add_socks`, `add_tunnel`, and `add_peer` all take an optional
 `egress` + `egress_arg` pair that selects how every upstream (target) socket
-leaves the host:
+leaves the host (`add_tunnel_server` bridges to a *local* target and so takes no
+egress of its own):
 
 | `egress` | `egress_arg` | Effect | Privilege |
 |----------|--------------|--------|-----------|
@@ -61,10 +79,10 @@ The MCP layer talks to a `PortmuxEngine` interface. Two backends share it:
 - **CLI backend** (`CliPortmuxEngine`, fallback) — spawns an external portmux
   binary (`PORTMUX_BIN`). Used automatically only if the native library is not
   bundled for the current platform. It supports `add_route` and `add_socks`
-  (with `source`/`device` egress); `add_tunnel`/`add_peer` are **not** available
-  on this backend (they are a distinct single-instance CLI subcommand that needs
-  a PSK file and cannot be composed with other routes in one invocation) — use
-  the embedded native backend for tunnels/peers.
+  (with `source`/`device` egress); `add_tunnel`/`add_tunnel_server`/`add_peer`
+  are **not** available on this backend (they are a distinct single-instance CLI
+  subcommand that needs a PSK file and cannot be composed with other routes in
+  one invocation) — use the embedded native backend for tunnels/peers.
 
 At startup the server picks the native backend when `libportmuxjni` is present
 for the platform, otherwise falls back to the CLI backend.
@@ -143,9 +161,10 @@ curl -s -X POST http://127.0.0.1:3339/mcp \
 ## Verified
 
 Built and run locally with the **embedded native engine**. The full MCP flow
-was exercised over Streamable HTTP: `initialize` → `tools/list` (9 tools:
-`add_route`, `add_socks`, `add_tunnel`, `add_peer`, `remove_route`,
-`list_routes`, `status`, `start`, `stop`) → `add_route` + `add_socks` (with a
+was exercised over Streamable HTTP: `initialize` → `tools/list` (10 tools:
+`add_route`, `add_socks`, `add_tunnel`, `add_peer`, `add_tunnel_server`,
+`remove_route`, `list_routes`, `status`, `start`, `stop`) → `add_route` +
+`add_socks` (with a
 `src=` egress) → `start`, and an actual TCP listener was opened in-process by
 the native engine — then `stop` closed it. The safety gates (non-loopback
 target rejected; `add_socks` rejected without `PORTMUX_ALLOW_ANY_TARGET`; egress
