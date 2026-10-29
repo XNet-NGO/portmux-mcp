@@ -26,7 +26,7 @@ import kotlinx.serialization.json.putJsonObject
  */
 fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
     val server = Server(
-        Implementation(name = "portmux-mcp", version = "0.2.2"),
+        Implementation(name = "portmux-mcp", version = "0.2.3"),
         ServerOptions(
             capabilities = ServerCapabilities(
                 tools = ServerCapabilities.Tools(listChanged = true),
@@ -381,30 +381,37 @@ fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
     server.addTool(
         name = "add_tunnel_server",
         description = "Add an ENCRYPTED TUNNEL SERVER (Noise NoisePSK_NN responder; " +
-            "AES-256-GCM or ChaCha20-Poly1305). Accepts encrypted clients on " +
-            "listen_addr:listen_port and bridges each accepted client to a LOCAL " +
-            "plaintext service bridge_addr:bridge_port. This is the counterpart to " +
-            "add_tunnel (the client): in a simple two-host forward loop the client " +
-            "dials this server and this server bridges to its local target. The PSK " +
-            "(64 hex chars) and cipher MUST match the client. WARNING: bridging to a " +
-            "non-loopback target REQUIRES the server to have been started with " +
-            "PORTMUX_ALLOW_ANY_TARGET=1. The server role bridges to a LOCAL target " +
-            "and takes no egress of its own.",
+            "AES-256-GCM or ChaCha20-Poly1305). DEFAULT = SINGLE-PORT peek-demux " +
+            "(recommended): accepts encrypted clients AND app clients on ONE port " +
+            "(listen_addr:listen_port), classifying each connection by peeking the " +
+            "first 2 bytes. App traffic sent to the SERVER's listen_port itself is " +
+            "muxed over the carrier and emerges at the TUNNEL CLIENT's target " +
+            "(the client holds target_addr:target_port); the server binds NO " +
+            "separate bridge. This is the counterpart to add_tunnel (the client): " +
+            "in a simple two-host forward loop the client dials this server and the " +
+            "client's target is where app traffic lands. The PSK (64 hex chars) and " +
+            "cipher MUST match the client. LEGACY two-port (non-default): pass " +
+            "bridge_port>0 to bind a SEPARATE plaintext public listener on " +
+            "bridge_addr:bridge_port; this legacy path is not serviced by the " +
+            "single-port mux loop and can collide on the bridge port, so avoid it " +
+            "unless explicitly required. WARNING: a non-loopback bridge (legacy " +
+            "two-port) REQUIRES the server to have been started with " +
+            "PORTMUX_ALLOW_ANY_TARGET=1. The server role takes no egress of its own.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 putJsonObject("listen_addr") {
                     put("type", "string")
-                    put("description", "address to accept encrypted clients on (default 0.0.0.0)")
+                    put("description", "address to accept encrypted (and app) clients on (default 0.0.0.0)")
                 }
                 putJsonObject("listen_port") {
-                    put("type", "integer"); put("description", "port to accept encrypted clients on")
+                    put("type", "integer"); put("description", "port to accept encrypted carriers + app clients on (single-port peek-demux)")
                 }
                 putJsonObject("bridge_addr") {
                     put("type", "string")
-                    put("description", "local plaintext service address to bridge to (e.g. 127.0.0.1)")
+                    put("description", "LEGACY two-port only: local plaintext service address to bridge to (e.g. 127.0.0.1); omit for single-port default")
                 }
                 putJsonObject("bridge_port") {
-                    put("type", "integer"); put("description", "local plaintext service port to bridge to")
+                    put("type", "integer"); put("description", "LEGACY two-port only: bind a separate plaintext listener on this port; omit or <=0 for single-port peek-demux (default)")
                 }
                 putJsonObject("psk") {
                     put("type", "string")
@@ -415,7 +422,7 @@ fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
                 }
                 putEgressProps(this)
             },
-            required = listOf("listen_port", "bridge_addr", "bridge_port", "psk"),
+            required = listOf("listen_port", "psk"),
         ),
     ) { request ->
         try {
@@ -428,8 +435,8 @@ fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
             val route = engine.addTunnelServer(
                 listenAddr = a["listen_addr"]?.jsonPrimitive?.content ?: "0.0.0.0",
                 listenPort = a["listen_port"]!!.jsonPrimitive.content.toInt(),
-                bridgeAddr = a["bridge_addr"]!!.jsonPrimitive.content,
-                bridgePort = a["bridge_port"]!!.jsonPrimitive.content.toInt(),
+                bridgeAddr = a["bridge_addr"]?.jsonPrimitive?.content ?: "",
+                bridgePort = a["bridge_port"]?.jsonPrimitive?.content?.toInt() ?: 0,
                 pskHex = a["psk"]!!.jsonPrimitive.content.trim(),
                 cipher = cipher,
                 egress = egress,
