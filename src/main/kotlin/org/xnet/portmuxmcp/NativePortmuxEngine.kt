@@ -248,15 +248,26 @@ class NativePortmuxEngine(
         egressArg: String,
     ): Route = lock.withLock {
         require(listenPort in 1..65535) { "listen port $listenPort out of range" }
-        require(bridgePort in 1..65535) { "bridge port $bridgePort out of range" }
         require(pskHex.length == 64 && pskHex.all { it.isHexDigit() }) {
             "psk must be 64 hex chars (32 bytes)"
         }
-        val bridge = bridgeAddr.ifBlank { "127.0.0.1" }
-        if (!allowNonLoopbackTargets && !isLoopback(bridge)) {
-            throw IllegalArgumentException(
-                "bridge target '$bridge' is not loopback; set PORTMUX_ALLOW_ANY_TARGET=1 to allow it",
-            )
+        // DEFAULT = single-port peek-demux: bridgePort<=0 => no separate bridge
+        // (pass 0 to the native layer). LEGACY two-port only when bridgePort>0.
+        val singlePort = bridgePort <= 0
+        val bridge: String
+        val effBridgePort: Int
+        if (singlePort) {
+            bridge = ""
+            effBridgePort = 0
+        } else {
+            require(bridgePort in 1..65535) { "bridge port $bridgePort out of range" }
+            bridge = bridgeAddr.ifBlank { "127.0.0.1" }
+            if (!allowNonLoopbackTargets && !isLoopback(bridge)) {
+                throw IllegalArgumentException(
+                    "bridge target '$bridge' is not loopback; set PORTMUX_ALLOW_ANY_TARGET=1 to allow non-loopback targets",
+                )
+            }
+            effBridgePort = bridgePort
         }
         validateEgress(egress, egressArg)
         val route = Route(
@@ -265,7 +276,7 @@ class NativePortmuxEngine(
             listenAddr = listenAddr.ifBlank { "0.0.0.0" },
             listenPort = listenPort,
             targetAddr = bridge,
-            targetPort = bridgePort,
+            targetPort = effBridgePort,
             isTunnelServer = true,
             egress = egress,
             egressArg = egressArg,

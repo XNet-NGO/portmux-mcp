@@ -85,7 +85,11 @@ data class Route(
             return "peer  $listenAddr:$listenPort (relay/peek-demux, encrypted)$eg"
         }
         if (isTunnelServer) {
-            return "tunnel-server  $listenAddr:$listenPort => $targetAddr:$targetPort (encrypted)$eg"
+            return if (targetPort > 0) {
+                "tunnel-server  $listenAddr:$listenPort => $targetAddr:$targetPort (legacy two-port, encrypted)$eg"
+            } else {
+                "tunnel-server  $listenAddr:$listenPort (single-port peek-demux, encrypted)$eg"
+            }
         }
         if (isTunnel) {
             val fwd = "tunnel  -> $serverAddr:$serverPort => $targetAddr:$targetPort (encrypted)$eg"
@@ -208,11 +212,22 @@ interface PortmuxEngine {
     /**
      * Add an encrypted tunnel SERVER: accept encrypted clients on
      * [listenAddr]:[listenPort] (the Noise responder side, authenticated by
-     * [pskHex], 64 hex chars) and bridge each accepted client to the local
-     * plaintext service [bridgeAddr]:[bridgePort]. [cipher] 0=AES-GCM,
-     * 1=ChaCha20-Poly1305. This is the counterpart role for a simple two-host
-     * forward loop (a client dials this server; this server bridges to its
-     * local target). Returns the created [Route]. Throws on validation error.
+     * [pskHex], 64 hex chars). [cipher] 0=AES-GCM, 1=ChaCha20-Poly1305. This is
+     * the counterpart role for a simple two-host forward loop (a client dials
+     * this server). Returns the created [Route]. Throws on validation error.
+     *
+     * DEFAULT = SINGLE-PORT peek-demux (recommended): when [bridgePort] is <= 0
+     * (the default), the server exposes ONE port ([listenPort]) that carries
+     * BOTH the encrypted carrier AND app clients (classified by peeking the
+     * first 2 bytes). The app's actual destination is the TUNNEL CLIENT's
+     * target: app traffic goes to this server's [listenPort] itself and emerges
+     * at the client's target_addr:target_port. The server binds NO separate
+     * bridge. This passes bridge_port=0 to the native layer.
+     *
+     * LEGACY two-port (non-default): when [bridgePort] > 0, the server binds a
+     * SEPARATE plaintext public listener on [bridgeAddr]:[bridgePort]. This path
+     * is marked legacy in the core, is not serviced by the single-port mux loop,
+     * and can collide on the bridge port. Only use it when explicitly required.
      *
      * NOTE: the native server role bridges to a LOCAL target and takes no
      * egress; [egress]/[egressArg] are accepted for API symmetry with the other
@@ -221,8 +236,8 @@ interface PortmuxEngine {
     fun addTunnelServer(
         listenAddr: String,
         listenPort: Int,
-        bridgeAddr: String,
-        bridgePort: Int,
+        bridgeAddr: String = "",
+        bridgePort: Int = 0,
         pskHex: String,
         cipher: Int = 0,
         egress: EgressMode = EgressMode.NONE,

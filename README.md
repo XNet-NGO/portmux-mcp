@@ -22,7 +22,7 @@ Built with the official [Kotlin MCP SDK](https://github.com/modelcontextprotocol
 | `add_socks` | `listen_addr?`, `listen_port`, `egress?`, `egress_arg?` | Add a SOCKS5 proxy listener (no-auth, CONNECT + UDP ASSOCIATE). An **open proxy** to arbitrary per-connection destinations; requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
 | `add_tunnel` | `server_addr`, `server_port`, `psk`, `target_addr?`, `target_port?`, `cipher?`, `egress?`, `egress_arg?`, `rlisten_addr?`, `rlisten_port?`, `rtarget_addr?`, `rtarget_port?`, `rproto?`, `jumps?`/`jump_hops?`, `jump_target_addr?`, `jump_target_port?`, `jump_proto?` | Add an encrypted NoisePSK_NN tunnel **client**. Dials a rendezvous server and splices the decrypted stream to a local target. Supports reverse-forward (ssh -R style) and multi-hop jump routing. Reaching an off-device server requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
 | `add_peer` | `listen_addr?`, `listen_port`, `psk`, `cipher?`, `egress?`, `egress_arg?` | Add a relay **peer** (single-port peek-demux tunnel server) for multi-hop jump chains. Relays OPENJ to the next hop or connects the terminal target. Requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
-| `add_tunnel_server` | `listen_addr?` (default `0.0.0.0`), `listen_port`, `bridge_addr`, `bridge_port`, `psk`, `cipher?`, `egress?`, `egress_arg?` | Add an encrypted NoisePSK_NN tunnel **server** (the responder role). Accepts encrypted clients on `listen_addr:listen_port` and bridges each to a local plaintext service `bridge_addr:bridge_port`. Counterpart to `add_tunnel` for a simple two-host forward loop. Bridging to a non-loopback target requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
+| `add_tunnel_server` | `listen_addr?` (default `0.0.0.0`), `listen_port`, `psk`, `cipher?`, `bridge_addr?`, `bridge_port?` (legacy), `egress?`, `egress_arg?` | Add an encrypted NoisePSK_NN tunnel **server** (the responder role). **Default = single-port peek-demux:** accepts encrypted carriers AND app clients on ONE port (`listen_addr:listen_port`), classified by peeking the first 2 bytes. App traffic to the server's `listen_port` itself is muxed over the carrier and emerges at the **client's** target (the client holds the destination); the server binds no separate bridge. Counterpart to `add_tunnel` for a simple two-host forward loop. **Legacy two-port** (non-default): pass `bridge_port>0` to bind a separate plaintext listener on `bridge_addr:bridge_port`; this legacy path is not serviced by the single-port mux loop and can collide on the bridge port — avoid unless required. A non-loopback legacy bridge requires `PORTMUX_ALLOW_ANY_TARGET=1`. |
 | `remove_route` | `id` | Remove a route by id. |
 | `list_routes` | — | List configured routes. |
 | `status` | — | Running state, route count, and `allow_any_target`. |
@@ -43,10 +43,16 @@ NoisePSK_NN PSK/cipher, and all three are wired here:
 - **`add_tunnel`** — the **client**: dials a rendezvous server and splices the
   decrypted stream to a local target. Also supports reverse-forward (ssh -R
   style) and multi-hop jump routing.
-- **`add_tunnel_server`** — the **server**: accepts encrypted clients and
-  bridges each to a local plaintext service. With a client this forms a simple
-  two-host forward loop (the client dials the server; the server bridges to its
-  local target).
+- **`add_tunnel_server`** — the **server**: accepts encrypted clients on ONE
+  port (`listen_port`) in **single-port peek-demux** mode (default). That one
+  port carries BOTH the encrypted carrier AND app clients: app traffic sent to
+  the server's `listen_port` itself is muxed over the carrier and emerges at the
+  **client's** target (`target_addr:target_port` — the *client* holds the
+  destination). The server binds **no** separate bridge. With a client this
+  forms a simple two-host forward loop (the client dials the server; app traffic
+  to the server's port lands at the client's target). A legacy two-port mode is
+  available by passing `bridge_port>0` (see below), but it is **not** the
+  recommended path.
 - **`add_peer`** — a relay **peer**: a single-port peek-demux tunnel server that
   relays OPENJ multi-hop streams to the next hop (or connects the terminal
   target), forming the intermediate/terminal nodes of a jump chain.
