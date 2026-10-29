@@ -26,7 +26,7 @@ import kotlinx.serialization.json.putJsonObject
  */
 fun buildPortmuxMcpServer(engine: PortmuxEngine): Server {
     val server = Server(
-        Implementation(name = "portmux-mcp", version = "0.2.1"),
+        Implementation(name = "portmux-mcp", version = "0.2.2"),
         ServerOptions(
             capabilities = ServerCapabilities(
                 tools = ServerCapabilities.Tools(listChanged = true),
